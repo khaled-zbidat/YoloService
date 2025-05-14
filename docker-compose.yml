@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  yolo:
+    build: .
+    ports:
+      - "8667:8667"
+    restart: always
+    volumes:
+      - ./uploads:/app/uploads

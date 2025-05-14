@@ -8,4 +8,6 @@ pillow>=9.5.0
 # Ultralytics YOLOv8 (includes minimal dependencies)
 ultralytics>=8.0.0
 python-multipart>=0.0.6
-
+torch>=2.0.0
+Jinja2>=3.1.2
+sqlite3
