@@ -10,4 +10,4 @@ ultralytics>=8.0.0
 python-multipart>=0.0.6
 torch>=2.0.0
 Jinja2>=3.1.2
-sqlite3
+
