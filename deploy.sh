@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# justr adding
 # Use fixed project path since you gave it:
 project_dir="/home/ubuntu/YoloService"
 
