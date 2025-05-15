@@ -7,4 +7,6 @@ services:
     restart: always
     volumes:
       - ./uploads:/app/uploads
-      - ./data:/app  
+      # Remove or change this line:
+      # - ./data:/app
+      - .:/app  # Mount the entire current dir so app.py is visible
