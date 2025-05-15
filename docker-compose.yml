@@ -4,9 +4,10 @@ services:
     build: .
     ports:
       - "8667:8667"
-    restart: always
     volumes:
-      - ./uploads:/app/uploads
-      # Remove or change this line:
-      # - ./data:/app
-      - .:/app  # Mount the entire current dir so app.py is visible
+      - ./uploads:/app/uploads  # For uploaded images
+      - yolo-data:/app/data     # For SQLite database
+    restart: unless-stopped
+
+volumes:
+  yolo-data:
