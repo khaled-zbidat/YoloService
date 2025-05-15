@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y \
 
 # Install Python dependencies
 COPY requirements.txt .
+COPY torch-requirements.txt .
+RUN pip install --no-cache-dir -r torch-requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy your app files
