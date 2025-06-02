@@ -1,0 +1,39 @@
+name: Deploy to Development
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy to Dev EC2
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.DEV_EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_PRIVATE_KEY }}
+        port: 22
+        script: |
+          cd /home/ubuntu/YoloService
+          
+          # Pull latest changes from the pushed branch
+          git fetch --all
+          git checkout ${{ github.head_ref || github.ref_name }}
+          git pull origin ${{ github.head_ref || github.ref_name }}
+          
+          # Run deployment script
+          chmod +x deploy.sh
+          ./deploy.sh
+          
+          # Verify deployment
+          sleep 10
+          curl -f http://localhost:8667/health || exit 1
+          echo "🚀 Development deployment successful!"
