@@ -9,8 +9,27 @@ cd "$project_dir" || { echo "❌ Directory $project_dir not found!"; exit 1; }
 
 # Check if Docker is running
 if ! docker info >/dev/null 2>&1; then
-    echo "❌ Docker is not running. Please start Docker daemon."
-    exit 1
+    echo "❌ Docker is not running or user doesn't have permission."
+    echo "🔄 Trying with sudo or checking if Docker needs to be started..."
+    
+    # Try to start Docker service if it's not running
+    if ! sudo systemctl is-active --quiet docker; then
+        sudo systemctl start docker
+        sleep 3
+    fi
+    
+    # If still no permission, use sudo for Docker commands
+    if ! docker info >/dev/null 2>&1; then
+        echo "⚠️  Using sudo for Docker commands due to permission issues"
+        DOCKER_CMD="sudo docker"
+        COMPOSE_CMD="sudo docker compose"
+    else
+        DOCKER_CMD="docker"
+        COMPOSE_CMD="docker compose"
+    fi
+else
+    DOCKER_CMD="docker"
+    COMPOSE_CMD="docker compose"
 fi
 
 # Check if docker-compose.yml exists
@@ -21,33 +40,33 @@ fi
 
 # Stop and remove existing containers
 echo "🛑 Stopping existing containers (if any)..."
-docker compose down --remove-orphans
+$COMPOSE_CMD down --remove-orphans
 
 # Clean up old images (optional - keeps only last 2 versions)
 echo "🧹 Cleaning up old Docker images..."
-docker image prune -f
+$DOCKER_CMD image prune -f
 
 # Build Docker images
 echo "🔨 Building Docker images..."
-docker compose build --no-cache || { echo "❌ Docker build failed!"; exit 1; }
+$COMPOSE_CMD build --no-cache || { echo "❌ Docker build failed!"; exit 1; }
 
 # Start containers in detached mode
 echo "▶️  Starting containers..."
-docker compose up -d || { echo "❌ Docker Compose up failed!"; exit 1; }
+$COMPOSE_CMD up -d || { echo "❌ Docker Compose up failed!"; exit 1; }
 
 # Give some time for container to start
 echo "⏳ Waiting for containers to start..."
 sleep 10
 
 # Check if the container is running
-container_name=$(docker compose ps -q yolo 2>/dev/null)
+container_name=$($COMPOSE_CMD ps -q yolo 2>/dev/null)
 
 if [ -z "$container_name" ]; then
   echo "❌ Docker container for yolo service is not running."
   echo "📋 Current container status:"
-  docker compose ps
+  $COMPOSE_CMD ps
   echo "📋 Last 20 logs:"
-  docker compose logs --tail 20 yolo
+  $COMPOSE_CMD logs --tail 20 yolo
   exit 1
 fi
 
@@ -77,10 +96,10 @@ while [ $attempt -le $max_attempts ]; do
 done
 
 echo "📋 Container status:"
-docker compose ps
+$COMPOSE_CMD ps
 
 echo "📋 Last 10 logs from container:"
-docker logs --tail 10 "$container_name"
+$DOCKER_CMD logs --tail 10 "$container_name"
 
 echo ""
 echo "🎉 Deployment completed successfully!"
