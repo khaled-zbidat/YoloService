@@ -3,7 +3,11 @@ name: Deploy to Development
 on:
   push:
     branches:
+      - develop
       - dev
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -22,12 +26,43 @@ jobs:
         key: ${{ secrets.EC2_PRIVATE_KEY }}
         port: 22
         script: |
-          cd /home/ubuntu/YoloService
+          # Install Docker if not already installed
+          if ! command -v docker &> /dev/null; then
+            echo "🐳 Installing Docker..."
+            sudo apt update
+            sudo apt install docker.io docker-compose-plugin -y
+            sudo usermod -aG docker ubuntu
+            sudo systemctl enable docker
+            sudo systemctl start docker
+            echo "✅ Docker installed successfully"
+          else
+            echo "✅ Docker already installed"
+          fi
           
-          # Pull latest changes from the pushed branch
-          git fetch --all
-          git checkout ${{ github.head_ref || github.ref_name }}
-          git pull origin ${{ github.head_ref || github.ref_name }}
+          # Install Git if not already installed
+          if ! command -v git &> /dev/null; then
+            echo "📦 Installing Git..."
+            sudo apt install git -y
+            echo "✅ Git installed successfully"
+          else
+            echo "✅ Git already installed"
+          fi
+          
+          # Clone repository if it doesn't exist, otherwise pull latest changes
+          if [ ! -d "/home/ubuntu/YoloService" ]; then
+            echo "📥 Cloning repository..."
+            cd /home/ubuntu
+            git clone ${{ github.server_url }}/${{ github.repository }}.git YoloService
+          else
+            echo "📥 Updating repository..."
+            cd /home/ubuntu/YoloService
+            # Pull latest changes from the pushed branch
+            git fetch --all
+            git checkout ${{ github.head_ref || github.ref_name }}
+            git pull origin ${{ github.head_ref || github.ref_name }}
+          fi
+          
+          cd /home/ubuntu/YoloService
           
           # Run deployment script
           chmod +x deploy.sh
