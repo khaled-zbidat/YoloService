@@ -95,6 +95,25 @@ while [ $attempt -le $max_attempts ]; do
     ((attempt++))
 done
 
+# Check OpenTelemetry Collector status
+echo "📊 Checking OpenTelemetry Collector status..."
+if systemctl is-active --quiet otelcol; then
+    echo "✅ OpenTelemetry Collector is running"
+    
+    # Verify metrics endpoint is accessible
+    if curl -sf http://localhost:8889/metrics >/dev/null 2>&1; then
+        echo "✅ OpenTelemetry Collector metrics endpoint is accessible at http://localhost:8889/metrics"
+    else
+        echo "⚠️  OpenTelemetry Collector metrics endpoint is not accessible"
+        echo "📋 OTC service status:"
+        sudo systemctl status otelcol --no-pager || true
+    fi
+else
+    echo "⚠️  OpenTelemetry Collector is not running"
+    echo "🔄 Attempting to start OpenTelemetry Collector..."
+    sudo systemctl start otelcol || echo "❌ Failed to start OpenTelemetry Collector"
+fi
+
 echo "📋 Container status:"
 $COMPOSE_CMD ps
 
@@ -105,3 +124,4 @@ echo ""
 echo "🎉 Deployment completed successfully!"
 echo "🌐 Service is available at: http://localhost:8667"
 echo "❤️  Health check: http://localhost:8667/health"
+echo "📊 OpenTelemetry metrics: http://localhost:8889/metrics"
