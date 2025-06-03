@@ -5,11 +5,6 @@ on:
     branches:
       - develop
       - dev
-  pull_request:
-    branches:
-      - main
-  workflow_dispatch:
-
 jobs:
   setup:
     runs-on: ubuntu-latest

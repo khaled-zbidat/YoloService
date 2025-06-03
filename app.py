@@ -6,6 +6,8 @@ import sqlite3
 import os
 import uuid
 import shutil
+import boto3
+
 #S3
 # Disable GPU usage
 import torch
@@ -54,6 +56,26 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON detection_objects (score)")
 
 init_db()
+AWS_REGION = "eu-central-1"
+S3_BUCKET_NAME = "khaledphotosbuckettelegram"
+
+s3 = boto3.client("s3")
+
+def download_image_from_s3(image_name: str, local_path: str) -> bool:
+    try:
+        s3.download_file(S3_BUCKET_NAME, image_name, local_path)
+        return True
+    except Exception:
+        return False
+
+def upload_image_to_s3(local_path: str, image_name: str) -> bool:
+    try:
+        s3.upload_file(local_path, S3_BUCKET_NAME, image_name)
+        return True
+    except Exception:
+        return False
+    
+
 
 def save_prediction_session(uid, original_image, predicted_image):
     """
@@ -75,27 +97,50 @@ def save_detection_object(prediction_uid, label, score, box):
             VALUES (?, ?, ?, ?)
         """, (prediction_uid, label, score, str(box)))
 
-@app.post("/predict")
-def predict(file: UploadFile = File(...)):
-    """
-    Predict objects in an image
-    """
-    ext = os.path.splitext(file.filename)[1]
-    uid = str(uuid.uuid4())
-    original_path = os.path.join(UPLOAD_DIR, uid + ext)
-    predicted_path = os.path.join(PREDICTED_DIR, uid + ext)
+from fastapi import Body
 
-    with open(original_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+@app.post("/predict")
+async def predict(
+    image_name: str | None = Body(None),
+    file: UploadFile | None = File(None)
+):
+    if image_name:
+        # Download image from S3
+        ext = os.path.splitext(image_name)[1] or ".jpg"
+        uid = str(uuid.uuid4())
+        original_filename = uid + ext
+        original_path = os.path.join(UPLOAD_DIR, original_filename)
+        
+        success = download_image_from_s3(image_name, original_path)
+        if not success:
+            raise HTTPException(status_code=404, detail="Image not found in S3")
+    elif file:
+        ext = os.path.splitext(file.filename)[1]
+        uid = str(uuid.uuid4())
+        original_filename = uid + ext
+        original_path = os.path.join(UPLOAD_DIR, original_filename)
+        
+        with open(original_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    else:
+        raise HTTPException(status_code=400, detail="No image_name or file provided")
+
+    # Predict as before
+    predicted_filename = uid + ext
+    predicted_path = os.path.join(PREDICTED_DIR, predicted_filename)
 
     results = model(original_path, device="cpu")
 
-    annotated_frame = results[0].plot()  # NumPy image with boxes
+    annotated_frame = results[0].plot()
     annotated_image = Image.fromarray(annotated_frame)
     annotated_image.save(predicted_path)
 
-    save_prediction_session(uid, original_path, predicted_path)
-    
+    # Upload original and predicted images to S3
+    upload_image_to_s3(original_path, original_filename)
+    upload_image_to_s3(predicted_path, predicted_filename)
+
+    save_prediction_session(uid, original_filename, predicted_filename)
+
     detected_labels = []
     for box in results[0].boxes:
         label_idx = int(box.cls[0].item())
@@ -106,10 +151,13 @@ def predict(file: UploadFile = File(...)):
         detected_labels.append(label)
 
     return {
-        "prediction_uid": uid, 
+        "prediction_uid": uid,
         "detection_count": len(results[0].boxes),
-        "labels": detected_labels
+        "labels": detected_labels,
+        "original_image_s3_key": original_filename,
+        "predicted_image_s3_key": predicted_filename
     }
+
 
 @app.get("/prediction/{uid}")
 def get_prediction_by_uid(uid: str):
