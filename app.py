@@ -1,313 +1,348 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import FileResponse, Response
-from ultralytics import YOLO
-from PIL import Image
-import sqlite3
+import telebot
+from loguru import logger
 import os
-import uuid
-import shutil
+import time
+import tempfile
+from telebot.types import InputFile
+from polybot.img_proc import Img
+import requests
 import boto3
+from botocore.exceptions import ClientError
+import uuid
+from datetime import datetime
 import json
-from typing import Optional
 
-#S3
-# Disable GPU usage
-import torch
-torch.cuda.is_available = lambda: False
-
-app = FastAPI()
-
-UPLOAD_DIR = "uploads/original"
-PREDICTED_DIR = "uploads/predicted"
-DB_PATH = "predictions.db"
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(PREDICTED_DIR, exist_ok=True)
-
-# Download the AI model (tiny model ~6MB)
-model = YOLO("yolov8n.pt")  
-
-# Initialize SQLite
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        # Create the predictions main table to store the prediction session
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS prediction_sessions (
-                uid TEXT PRIMARY KEY,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                original_image TEXT,
-                predicted_image TEXT
-            )
-        """)
-        
-        # Create the objects table to store individual detected objects in a given image
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS detection_objects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prediction_uid TEXT,
-                label TEXT,
-                score REAL,
-                box TEXT,
-                FOREIGN KEY (prediction_uid) REFERENCES prediction_sessions (uid)
-            )
-        """)
-        
-        # Create index for faster queries
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_uid ON detection_objects (prediction_uid)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_label ON detection_objects (label)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON detection_objects (score)")
-
-init_db()
-AWS_REGION = "eu-central-1"
-S3_BUCKET_NAME = "khaledphotosbuckettelegram"
-
-s3 = boto3.client("s3")
-
-def download_image_from_s3(image_name: str, local_path: str) -> bool:
-    try:
-        s3.download_file(S3_BUCKET_NAME, image_name, local_path)
-        return True
-    except Exception as e:
-        print(f"Error downloading from S3: {e}")
-        return False
-
-def upload_image_to_s3(local_path: str, image_name: str) -> bool:
-    try:
-        s3.upload_file(local_path, S3_BUCKET_NAME, image_name)
-        return True
-    except Exception as e:
-        print(f"Error uploading to S3: {e}")
-        return False
-
-def save_prediction_session(uid, original_image, predicted_image):
-    """
-    Save prediction session to database
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO prediction_sessions (uid, original_image, predicted_image)
-            VALUES (?, ?, ?)
-        """, (uid, original_image, predicted_image))
-
-def save_detection_object(prediction_uid, label, score, box):
-    """
-    Save detection object to database
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO detection_objects (prediction_uid, label, score, box)
-            VALUES (?, ?, ?, ?)
-        """, (prediction_uid, label, score, str(box)))
-
-@app.post("/predict")
-async def predict(
-    request: Request,
-    file: Optional[UploadFile] = File(None)
-):
-    """
-    Predict endpoint with fallback logic:
-    1. First check for image_name in request body (JSON)
-    2. If not found, check for uploaded file
-    3. If neither found, return 400 error
-    """
-    
-    # Generate unique ID for this prediction
-    uid = str(uuid.uuid4())
-    
-    # Try to read JSON body first (for image_name)
-    image_name = None
-    try:
-        body = await request.body()
-        if body:
-            json_data = json.loads(body.decode())
-            image_name = json_data.get("image_name")
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        # If JSON parsing fails, continue to check for file upload
-        pass
-    
-    # FALLBACK LOGIC:
-    if image_name:
-        # Case 1: Image name provided - download from S3
-        print(f"Processing image from S3: {image_name}")
-        ext = os.path.splitext(image_name)[1] or ".jpg"
-        original_filename = uid + ext
-        original_path = os.path.join(UPLOAD_DIR, original_filename)
-        
-        success = download_image_from_s3(image_name, original_path)
-        if not success:
-            raise HTTPException(status_code=404, detail="Image not found in S3")
-            
-    elif file:
-        # Case 2: File uploaded - save locally
-        print(f"Processing uploaded file: {file.filename}")
-        ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
-        original_filename = uid + ext
-        original_path = os.path.join(UPLOAD_DIR, original_filename)
-        
-        with open(original_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-            
-    else:
-        # Case 3: Neither image_name nor file provided
-        raise HTTPException(
-            status_code=400, 
-            detail="Bad request: Please provide either 'image_name' in JSON body or upload a file"
+class Bot:
+    def __init__(self, token, telegram_chat_url):
+        self.telegram_bot_client = telebot.TeleBot(token)
+        self.telegram_bot_client.remove_webhook()
+        time.sleep(0.5)
+        self.telegram_bot_client.set_webhook(
+            url=f'{telegram_chat_url}/{token}/',
+            timeout=60
         )
+        logger.info(f'Telegram Bot information\n\n{self.telegram_bot_client.get_me()}')
 
-    # Process the image with YOLO
-    try:
-        predicted_filename = uid + ext
-        predicted_path = os.path.join(PREDICTED_DIR, predicted_filename)
+    def send_text(self, chat_id, text):
+        try:
+            self.telegram_bot_client.send_message(chat_id, text)
+        except Exception as e:
+            print(f"Error sending message: {e}")
 
-        print(f"Running YOLO prediction on: {original_path}")
-        results = model(original_path, device="cpu")
+    def send_text_with_quote(self, chat_id, text, quoted_msg_id):
+        self.telegram_bot_client.send_message(chat_id, text, reply_to_message_id=quoted_msg_id)
 
-        # Create annotated image
-        annotated_frame = results[0].plot()
-        annotated_image = Image.fromarray(annotated_frame)
-        annotated_image.save(predicted_path)
+    def is_current_msg_photo(self, msg):
+        return 'photo' in msg
 
-        # Upload both original and predicted images to S3
-        original_s3_key = f"predictions/original_{original_filename}"
-        predicted_s3_key = f"predictions/predicted_{predicted_filename}"
+    def download_user_photo(self, msg):
+        if not self.is_current_msg_photo(msg):
+            raise RuntimeError(f'Message content of type \'photo\' expected')
+
+        file_info = self.telegram_bot_client.get_file(msg['photo'][-1]['file_id'])
+        data = self.telegram_bot_client.download_file(file_info.file_path)
+
+        temp_dir = tempfile.gettempdir()
+        folder_name = os.path.join(temp_dir, file_info.file_path.split('/')[0])
+        if not os.path.exists(folder_name):
+            os.makedirs(folder_name)
+
+        file_path = os.path.join(temp_dir, file_info.file_path)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'wb') as photo:
+            photo.write(data)
+
+        return file_path
+
+    def send_photo(self, chat_id, img_path):
+        if not os.path.exists(img_path):
+            raise RuntimeError("Image path doesn't exist")
+
+        self.telegram_bot_client.send_photo(chat_id, InputFile(img_path))
+
+    def handle_message(self, msg):
+        logger.info(f'Incoming message: {msg}')
+        self.send_text(msg['chat']['id'], f'Your original message: {msg["text"]}')
+
+
+class ImageProcessingBot(Bot):
+    def __init__(self, token, telegram_chat_url):
+        super().__init__(token, telegram_chat_url)
+        self.concat_buffer = {}
         
-        upload_image_to_s3(original_path, original_s3_key)
-        upload_image_to_s3(predicted_path, predicted_s3_key)
-
-        # Save to database
-        save_prediction_session(uid, original_s3_key, predicted_s3_key)
-
-        # Process detection results
-        detected_labels = []
-        for box in results[0].boxes:
-            label_idx = int(box.cls[0].item())
-            label = model.names[label_idx]
-            score = float(box.conf[0])
-            bbox = box.xyxy[0].tolist()
-            save_detection_object(uid, label, score, bbox)
-            detected_labels.append(label)
-
-        return {
-            "prediction_uid": uid,
-            "detection_count": len(results[0].boxes),
-            "labels": detected_labels,
-            "original_image_s3_key": original_s3_key,
-            "predicted_image_s3_key": predicted_s3_key,
-            "message": f"Successfully detected {len(detected_labels)} objects: {', '.join(set(detected_labels))}"
-        }
+        # Initialize S3 client
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_REGION', 'us-east-1')
+        )
+        self.s3_bucket = os.getenv('S3_BUCKET_NAME')
         
-    except Exception as e:
-        print(f"Error during prediction: {e}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+        if not all([os.getenv('AWS_ACCESS_KEY_ID'), os.getenv('AWS_SECRET_ACCESS_KEY'), self.s3_bucket]):
+            logger.error("Missing AWS credentials or S3 bucket name in environment variables")
+            raise ValueError("AWS S3 configuration is incomplete")
 
+    def upload_to_s3(self, file_path, object_name=None):
+        """Upload a file to S3 bucket"""
+        if object_name is None:
+            # Generate unique filename with timestamp and UUID
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            file_extension = os.path.splitext(file_path)[1]
+            object_name = f"images/{timestamp}_{unique_id}{file_extension}"
 
-@app.get("/prediction/{uid}")
-def get_prediction_by_uid(uid: str):
-    """
-    Get prediction session by uid with all detected objects
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        # Get prediction session
-        session = conn.execute("SELECT * FROM prediction_sessions WHERE uid = ?", (uid,)).fetchone()
-        if not session:
-            raise HTTPException(status_code=404, detail="Prediction not found")
+        try:
+            self.s3_client.upload_file(file_path, self.s3_bucket, object_name)
+            logger.info(f"File uploaded successfully to S3: {object_name}")
+            return object_name
+        except ClientError as e:
+            logger.error(f"Failed to upload file to S3: {e}")
+            return None
+
+    def download_from_s3(self, object_name, local_path):
+        """Download a file from S3 bucket"""
+        try:
+            self.s3_client.download_file(self.s3_bucket, object_name, local_path)
+            logger.info(f"File downloaded successfully from S3: {object_name}")
+            return True
+        except ClientError as e:
+            logger.error(f"Failed to download file from S3: {e}")
+            return False
+
+    def send_to_yolo_service(self, image_name):
+        """Send image name to YOLO service with enhanced error handling"""
+        try:
+            yolo_url = os.getenv("YOLO_URL")
             
-        # Get all detection objects for this prediction
-        objects = conn.execute(
-            "SELECT * FROM detection_objects WHERE prediction_uid = ?", 
-            (uid,)
-        ).fetchall()
+            # Debug: Log the YOLO URL and image name
+            logger.info(f"YOLO URL: {yolo_url}")
+            logger.info(f"Sending image name to YOLO: {image_name}")
+            
+            if not yolo_url:
+                logger.error("YOLO_URL environment variable is not set")
+                return "Error: YOLO service URL not configured"
+            
+            # Ensure URL ends with /predict
+            if not yolo_url.endswith('/predict'):
+                yolo_url = yolo_url.rstrip('/') + '/predict'
+            
+            # Send only the image name in the request body
+            payload = {"image_name": image_name}
+            headers = {'Content-Type': 'application/json'}
+            
+            logger.info(f"Making request to: {yolo_url}")
+            logger.info(f"Payload: {payload}")
+            
+            response = requests.post(
+                yolo_url, 
+                json=payload, 
+                headers=headers,
+                timeout=60  # Increased timeout
+            )
+            
+            logger.info(f"YOLO service response status: {response.status_code}")
+            logger.info(f"YOLO service response headers: {dict(response.headers)}")
+            
+            if response.status_code == 200:
+                try:
+                    result_json = response.json()
+                    logger.info(f"YOLO service response JSON: {result_json}")
+                    
+                    # Extract meaningful information from the response
+                    if isinstance(result_json, dict):
+                        detection_count = result_json.get('detection_count', 0)
+                        labels = result_json.get('labels', [])
+                        message = result_json.get('message', '')
+                        
+                        if detection_count > 0:
+                            unique_labels = list(set(labels))
+                            return f"🎯 Detected {detection_count} objects: {', '.join(unique_labels)}\n{message}"
+                        else:
+                            return "🔍 No objects detected in the image"
+                    else:
+                        return f"✅ Prediction completed: {result_json}"
+                        
+                except json.JSONDecodeError:
+                    logger.warning("Response is not JSON, returning raw text")
+                    return f"✅ Prediction result: {response.text[:200]}"
+                    
+            else:
+                error_msg = f"YOLO service error (Status {response.status_code})"
+                try:
+                    error_detail = response.json()
+                    logger.error(f"YOLO service error details: {error_detail}")
+                    error_msg += f": {error_detail.get('detail', response.text[:100])}"
+                except:
+                    logger.error(f"YOLO service error text: {response.text}")
+                    error_msg += f": {response.text[:100]}"
+                
+                return error_msg
+                
+        except requests.exceptions.Timeout:
+            logger.error("YOLO service request timed out")
+            return "❌ Prediction failed: Service timeout (>60s)"
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Failed to connect to YOLO service: {str(e)}")
+            return f"❌ Connection failed: Cannot reach YOLO service at {yolo_url}"
+        except Exception as e:
+            logger.error(f"Unexpected error calling YOLO service: {str(e)}")
+            return f"❌ Prediction failed: {str(e)}"
+
+    def handle_message(self, msg):
+        logger.info(f'Incoming message: {msg}')
         
-        return {
-            "uid": session["uid"],
-            "timestamp": session["timestamp"],
-            "original_image": session["original_image"],
-            "predicted_image": session["predicted_image"],
-            "detection_objects": [
-                {
-                    "id": obj["id"],
-                    "label": obj["label"],
-                    "score": obj["score"],
-                    "box": obj["box"]
-                } for obj in objects
-            ]
-        }
-
-@app.get("/predictions/label/{label}")
-def get_predictions_by_label(label: str):
-    """
-    Get prediction sessions containing objects with specified label
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
-            SELECT DISTINCT ps.uid, ps.timestamp
-            FROM prediction_sessions ps
-            JOIN detection_objects do ON ps.uid = do.prediction_uid
-            WHERE do.label = ?
-        """, (label,)).fetchall()
+        if 'chat' not in msg:
+            print("Warning: Message missing 'chat' field, skipping...")
+            return
         
-        return [{"uid": row["uid"], "timestamp": row["timestamp"]} for row in rows]
+        chat_id = msg['chat']['id']
+        self.send_text(chat_id, f"Hello {msg['from']['first_name']}! Welcome to the Image Processing Bot.")
 
-@app.get("/predictions/score/{min_score}")
-def get_predictions_by_score(min_score: float):
-    """
-    Get prediction sessions containing objects with score >= min_score
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
-            SELECT DISTINCT ps.uid, ps.timestamp
-            FROM prediction_sessions ps
-            JOIN detection_objects do ON ps.uid = do.prediction_uid
-            WHERE do.score >= ?
-        """, (min_score,)).fetchall()
-        
-        return [{"uid": row["uid"], "timestamp": row["timestamp"]} for row in rows]
+        if self.is_current_msg_photo(msg):
+            try:
+                if 'caption' not in msg or not msg['caption']:
+                    self.send_text(
+                        chat_id,
+                        "Please provide a caption with the image. Available filters are: "
+                        "Blur, Contour, Rotate, Segment, Salt and pepper, Concat, Predict"
+                    )
+                    return
 
-@app.get("/image/{type}/{filename}")
-def get_image(type: str, filename: str):
-    """
-    Get image by type and filename
-    """
-    if type not in ["original", "predicted"]:
-        raise HTTPException(status_code=400, detail="Invalid image type")
-    path = os.path.join("uploads", type, filename)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(path)
+                caption = msg['caption'].strip().lower()
+                available_filters = ['blur', 'contour', 'rotate', 'segment', 'salt and pepper', 'concat', 'predict']
+                matched_filter = None
+                params = []
 
-@app.get("/prediction/{uid}/image")
-def get_prediction_image(uid: str, request: Request):
-    """
-    Get prediction image by uid
-    """
-    accept = request.headers.get("accept", "")
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT predicted_image FROM prediction_sessions WHERE uid = ?", (uid,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Prediction not found")
-        image_path = row[0]
+                for f in available_filters:
+                    if caption.startswith(f):
+                        matched_filter = f
+                        params = caption[len(f):].strip().split()
+                        break
 
-    if not os.path.exists(image_path):
-        raise HTTPException(status_code=404, detail="Predicted image file not found")
+                if not matched_filter:
+                    self.send_text(chat_id, f"Invalid filter. Available: {', '.join(f.title() for f in available_filters)}")
+                    return
 
-    if "image/png" in accept:
-        return FileResponse(image_path, media_type="image/png")
-    elif "image/jpeg" in accept or "image/jpg" in accept:
-        return FileResponse(image_path, media_type="image/jpeg")
-    else:
-        # If the client doesn't accept image, respond with 406 Not Acceptable
-        raise HTTPException(status_code=406, detail="Client does not accept an image format")
+                # Download the photo locally first
+                photo_path = self.download_user_photo(msg)
+                logger.info(f'Photo downloaded to: {photo_path}')
 
-@app.get("/health")
-def health():
-    """
-    Health check endpoint
-    """
-    return {"status": "ok"}
+                # Upload image to S3
+                self.send_text(chat_id, "📤 Uploading image to S3...")
+                s3_object_name = self.upload_to_s3(photo_path)
+                
+                if not s3_object_name:
+                    self.send_text(chat_id, "❌ Failed to upload image to S3. Please try again.")
+                    return
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8667)
+                logger.info(f'Image uploaded to S3: {s3_object_name}')
+                self.send_text(chat_id, f"✅ Image uploaded: {s3_object_name}")
+
+                if matched_filter == 'predict':
+                    self.send_text(chat_id, "🤖 Sending image to YOLO prediction service...")
+                    prediction_result = self.send_to_yolo_service(s3_object_name)
+                    self.send_text(chat_id, f"🔮 Prediction Result:\n{prediction_result}")
+
+                elif matched_filter != 'concat':
+                    img = Img(photo_path)
+                    self.send_text(chat_id, f"🎨 Applying {matched_filter.title()} filter...")
+
+                    if matched_filter == 'blur':
+                        blur_level = int(params[0]) if params and params[0].isdigit() else 16
+                        img.blur(blur_level)
+
+                    elif matched_filter == 'contour':
+                        img.contour()
+
+                    elif matched_filter == 'rotate':
+                        rotation_count = int(params[0]) if params and params[0].isdigit() else 1
+                        for _ in range(rotation_count):
+                            img.rotate()
+
+                    elif matched_filter == 'segment' and hasattr(img, 'segment'):
+                        img.segment()
+
+                    elif matched_filter == 'salt and pepper' and hasattr(img, 'salt_n_pepper'):
+                        img.salt_n_pepper()
+
+                    else:
+                        self.send_text(chat_id, f"❌ {matched_filter.title()} filter is not implemented.")
+                        return
+
+                    output_path = os.path.join(tempfile.gettempdir(), os.path.basename(photo_path).split('.')[0] + '_filtered.jpg')
+                    new_image_path = img.save_img(output_path)
+                    
+                    # Upload processed image to S3
+                    processed_s3_name = self.upload_to_s3(new_image_path)
+                    if processed_s3_name:
+                        logger.info(f'Processed image uploaded to S3: {processed_s3_name}')
+                    
+                    self.send_photo(chat_id, new_image_path)
+
+                else:  # concat
+                    if chat_id in self.concat_buffer:
+                        first_s3_name = self.concat_buffer.pop(chat_id)
+                        
+                        # Download first image from S3
+                        first_temp_path = os.path.join(tempfile.gettempdir(), f'concat_first_{int(time.time())}.jpg')
+                        if self.download_from_s3(first_s3_name, first_temp_path):
+                            img1 = Img(first_temp_path)
+                            img2 = Img(photo_path)
+                            img1.concat(img2)
+                            output_path = os.path.join(tempfile.gettempdir(), f'concat_{int(time.time())}.jpg')
+                            result = img1.save_img(output_path)
+                            
+                            # Upload concatenated image to S3
+                            concat_s3_name = self.upload_to_s3(result)
+                            if concat_s3_name:
+                                logger.info(f'Concatenated image uploaded to S3: {concat_s3_name}')
+                            
+                            self.send_text(chat_id, "✅ Images concatenated successfully!")
+                            self.send_photo(chat_id, result)
+                        else:
+                            self.send_text(chat_id, "❌ Failed to download first image from S3.")
+                    else:
+                        self.concat_buffer[chat_id] = s3_object_name
+                        self.send_text(chat_id, "✅ First image received and uploaded to S3. Please send the second image with caption 'concat'.")
+
+            except Exception as e:
+                logger.error(f"Error processing image: {str(e)}")
+                self.send_text(chat_id, f"❌ Error processing image: {str(e)}")
+
+        elif 'text' in msg:
+            if msg['text'].startswith('/'):
+                if msg['text'] in ['/start', '/help']:
+                    self.send_text(
+                        chat_id,
+                        "🤖 Welcome to the Image Processing Bot!\n\n"
+                        "📸 Send me a photo with one of these captions:\n"
+                        "• Blur [level] - Apply blur effect\n"
+                        "• Contour - Find edges\n"
+                        "• Rotate [count] - Rotate image\n"
+                        "• Segment - Image segmentation\n"
+                        "• Salt and pepper - Add noise\n"
+                        "• Concat - Combine two images\n"
+                        "• Predict - Run YOLO object detection\n"
+                    )
+                elif msg['text'] == '/debug':
+                    # Debug command to check configuration
+                    yolo_url = os.getenv("YOLO_URL", "Not set")
+                    s3_bucket = os.getenv("S3_BUCKET_NAME", "Not set")
+                    aws_region = os.getenv("AWS_REGION", "Not set")
+                    
+                    debug_info = f"""🔧 Debug Information:
+YOLO URL: {yolo_url}
+S3 Bucket: {s3_bucket}
+AWS Region: {aws_region}
+AWS Access Key: {'Set' if os.getenv('AWS_ACCESS_KEY_ID') else 'Not set'}
+AWS Secret Key: {'Set' if os.getenv('AWS_SECRET_ACCESS_KEY') else 'Not set'}"""
+                    
+                    self.send_text(chat_id, debug_info)
+                else:
+                    self.send_text(chat_id, "❓ Unknown command. Send /help for options or /debug for configuration info.")
+            else:
+                self.send_text(chat_id, "📸 Please send a photo with a caption. Type /help for filter options.")
+
+        else:
+            self.send_text(chat_id, "🤖 I can only process photo messages. Send /help for instructions.")
