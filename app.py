@@ -7,6 +7,8 @@ import os
 import uuid
 import shutil
 import boto3
+import json
+from typing import Optional
 
 #S3
 # Disable GPU usage
@@ -65,17 +67,17 @@ def download_image_from_s3(image_name: str, local_path: str) -> bool:
     try:
         s3.download_file(S3_BUCKET_NAME, image_name, local_path)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"Error downloading from S3: {e}")
         return False
 
 def upload_image_to_s3(local_path: str, image_name: str) -> bool:
     try:
         s3.upload_file(local_path, S3_BUCKET_NAME, image_name)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"Error uploading to S3: {e}")
         return False
-    
-
 
 def save_prediction_session(uid, original_image, predicted_image):
     """
@@ -97,66 +99,106 @@ def save_detection_object(prediction_uid, label, score, box):
             VALUES (?, ?, ?, ?)
         """, (prediction_uid, label, score, str(box)))
 
-from fastapi import Body
-
 @app.post("/predict")
 async def predict(
-    image_name: str | None = Body(None),
-    file: UploadFile | None = File(None)
+    request: Request,
+    file: Optional[UploadFile] = File(None)
 ):
+    """
+    Predict endpoint with fallback logic:
+    1. First check for image_name in request body (JSON)
+    2. If not found, check for uploaded file
+    3. If neither found, return 400 error
+    """
+    
+    # Generate unique ID for this prediction
+    uid = str(uuid.uuid4())
+    
+    # Try to read JSON body first (for image_name)
+    image_name = None
+    try:
+        body = await request.body()
+        if body:
+            json_data = json.loads(body.decode())
+            image_name = json_data.get("image_name")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # If JSON parsing fails, continue to check for file upload
+        pass
+    
+    # FALLBACK LOGIC:
     if image_name:
-        # Download image from S3
+        # Case 1: Image name provided - download from S3
+        print(f"Processing image from S3: {image_name}")
         ext = os.path.splitext(image_name)[1] or ".jpg"
-        uid = str(uuid.uuid4())
         original_filename = uid + ext
         original_path = os.path.join(UPLOAD_DIR, original_filename)
         
         success = download_image_from_s3(image_name, original_path)
         if not success:
             raise HTTPException(status_code=404, detail="Image not found in S3")
+            
     elif file:
-        ext = os.path.splitext(file.filename)[1]
-        uid = str(uuid.uuid4())
+        # Case 2: File uploaded - save locally
+        print(f"Processing uploaded file: {file.filename}")
+        ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
         original_filename = uid + ext
         original_path = os.path.join(UPLOAD_DIR, original_filename)
         
         with open(original_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
+            
     else:
-        raise HTTPException(status_code=400, detail="No image_name or file provided")
+        # Case 3: Neither image_name nor file provided
+        raise HTTPException(
+            status_code=400, 
+            detail="Bad request: Please provide either 'image_name' in JSON body or upload a file"
+        )
 
-    # Predict as before
-    predicted_filename = uid + ext
-    predicted_path = os.path.join(PREDICTED_DIR, predicted_filename)
+    # Process the image with YOLO
+    try:
+        predicted_filename = uid + ext
+        predicted_path = os.path.join(PREDICTED_DIR, predicted_filename)
 
-    results = model(original_path, device="cpu")
+        print(f"Running YOLO prediction on: {original_path}")
+        results = model(original_path, device="cpu")
 
-    annotated_frame = results[0].plot()
-    annotated_image = Image.fromarray(annotated_frame)
-    annotated_image.save(predicted_path)
+        # Create annotated image
+        annotated_frame = results[0].plot()
+        annotated_image = Image.fromarray(annotated_frame)
+        annotated_image.save(predicted_path)
 
-    # Upload original and predicted images to S3
-    upload_image_to_s3(original_path, original_filename)
-    upload_image_to_s3(predicted_path, predicted_filename)
+        # Upload both original and predicted images to S3
+        original_s3_key = f"predictions/original_{original_filename}"
+        predicted_s3_key = f"predictions/predicted_{predicted_filename}"
+        
+        upload_image_to_s3(original_path, original_s3_key)
+        upload_image_to_s3(predicted_path, predicted_s3_key)
 
-    save_prediction_session(uid, original_filename, predicted_filename)
+        # Save to database
+        save_prediction_session(uid, original_s3_key, predicted_s3_key)
 
-    detected_labels = []
-    for box in results[0].boxes:
-        label_idx = int(box.cls[0].item())
-        label = model.names[label_idx]
-        score = float(box.conf[0])
-        bbox = box.xyxy[0].tolist()
-        save_detection_object(uid, label, score, bbox)
-        detected_labels.append(label)
+        # Process detection results
+        detected_labels = []
+        for box in results[0].boxes:
+            label_idx = int(box.cls[0].item())
+            label = model.names[label_idx]
+            score = float(box.conf[0])
+            bbox = box.xyxy[0].tolist()
+            save_detection_object(uid, label, score, bbox)
+            detected_labels.append(label)
 
-    return {
-        "prediction_uid": uid,
-        "detection_count": len(results[0].boxes),
-        "labels": detected_labels,
-        "original_image_s3_key": original_filename,
-        "predicted_image_s3_key": predicted_filename
-    }
+        return {
+            "prediction_uid": uid,
+            "detection_count": len(results[0].boxes),
+            "labels": detected_labels,
+            "original_image_s3_key": original_s3_key,
+            "predicted_image_s3_key": predicted_s3_key,
+            "message": f"Successfully detected {len(detected_labels)} objects: {', '.join(set(detected_labels))}"
+        }
+        
+    except Exception as e:
+        print(f"Error during prediction: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
 @app.get("/prediction/{uid}")
