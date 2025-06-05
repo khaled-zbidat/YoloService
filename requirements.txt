@@ -8,4 +8,6 @@ pillow>=9.5.0
 # Ultralytics YOLOv8 (includes minimal dependencies)
 ultralytics>=8.0.0
 python-multipart>=0.0.6
-boto3
+boto3==1.29.7
+pydantic==2.4.2
+python-multipart==0.0.6
