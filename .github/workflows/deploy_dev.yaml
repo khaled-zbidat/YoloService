@@ -77,15 +77,39 @@ jobs:
         port: 22
         envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,S3_BUCKET_NAME
         script: |
-          # Clone repository if it doesn't exist, otherwise pull latest changes
-          ssh ec2 "
-            if [ -d ~/${REPO_NAME} ]; then
-              cd ~/${REPO_NAME} && git checkout dev && git reset --hard && git clean -fd && git pull origin dev;
-            else
-              git clone -b dev ${REPO_URL} ~/${REPO_NAME};
-            fi"
+          # Stop any running containers first
+          docker stop yolo-service || true
+          docker rm yolo-service || true
+          
+          echo "📁 Updating repository to dev branch..."
+          
+          if [ ! -d "/home/ubuntu/YoloService" ]; then
+            echo "📥 Cloning repository with dev branch..."
+            cd /home/ubuntu
+            git clone -b dev https://github.com/khaled-zbidat/YoloService.git YoloService
+          else
+            echo "📥 Repository exists, forcing checkout to dev branch..."
+            cd /home/ubuntu/YoloService
+            
+            # Discard any local changes
+            git reset --hard HEAD
+            git clean -fd
+            
+            # Fetch all branches
+            git fetch --all
+            
+            # Force checkout to dev branch
+            git checkout dev
+            
+            # Pull latest changes from dev
+            git pull origin dev
+          fi
           
           cd /home/ubuntu/YoloService
+          
+          # Verify we're on the right branch and commit
+          echo "✅ Current branch: $(git branch --show-current)"
+          echo "✅ Latest commit: $(git log --oneline -1)"
           
           # Create .env file with AWS credentials
           echo "Creating .env file with AWS credentials..."
