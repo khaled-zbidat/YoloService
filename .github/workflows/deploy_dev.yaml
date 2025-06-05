@@ -78,18 +78,12 @@ jobs:
         envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,S3_BUCKET_NAME
         script: |
           # Clone repository if it doesn't exist, otherwise pull latest changes
-          if [ ! -d "/home/ubuntu/YoloService" ]; then
-            echo "📥 Cloning repository..."
-            cd /home/ubuntu
-            git clone ${{ github.server_url }}/${{ github.repository }}.git YoloService
-          else
-            echo "📥 Updating repository..."
-            cd /home/ubuntu/YoloService
-            # Pull latest changes from the pushed branch
-            git fetch --all
-            git checkout ${{ github.head_ref || github.ref_name }}
-            git pull origin ${{ github.head_ref || github.ref_name }}
-          fi
+          ssh ec2 "
+            if [ -d ~/${REPO_NAME} ]; then
+              cd ~/${REPO_NAME} && git checkout dev && git reset --hard && git clean -fd && git pull origin dev;
+            else
+              git clone -b dev ${REPO_URL} ~/${REPO_NAME};
+            fi"
           
           cd /home/ubuntu/YoloService
           
