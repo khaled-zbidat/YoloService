@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from typing import Optional
 import tempfile
 import logging
+import json
 
 # Disable GPU usage
 import torch
@@ -165,7 +166,10 @@ def process_image(image_path, uid):
         raise HTTPException(status_code=500, detail=f"Failed to process image: {str(e)}")
 
 @app.post("/predict")
-async def predict(request: Request, file: Optional[UploadFile] = File(None)):
+async def predict(
+    image_name_request: Optional[ImageNameRequest] = None,
+    file: Optional[UploadFile] = File(None)
+):
     """
     Predict objects in an image with fallback logic:
     1. First check for image_name in request body
@@ -179,56 +183,48 @@ async def predict(request: Request, file: Optional[UploadFile] = File(None)):
     predicted_path = None
     
     try:
-        # Try to get image_name from request body first
-        try:
-            body = await request.body()
-            if body:
-                import json
-                request_data = json.loads(body)
-                image_name = request_data.get('image_name')
-                if image_name:
-                    logger.info(f"Processing S3 image: {image_name}")
-                    
-                    # Download image from S3
-                    ext = os.path.splitext(image_name)[1] or '.jpg'
-                    original_path = os.path.join(UPLOAD_DIR, uid + ext)
-                    download_from_s3(image_name, original_path)
-                    s3_original_key = image_name
-                    
-                    # Process image
-                    results, predicted_path = process_image(original_path, uid)
-                    
-                    # Upload predicted image to S3
-                    predicted_s3_key = f"predicted/{uid}{ext}"
-                    upload_to_s3(predicted_path, predicted_s3_key)
-                    s3_predicted_key = predicted_s3_key
-                    
-                    # Save to database
-                    save_prediction_session(uid, original_path, predicted_path, s3_original_key, s3_predicted_key)
-                    
-                    # Extract detection results
-                    detected_labels = []
-                    for box in results[0].boxes:
-                        label_idx = int(box.cls[0].item())
-                        label = model.names[label_idx]
-                        score = float(box.conf[0])
-                        bbox = box.xyxy[0].tolist()
-                        save_detection_object(uid, label, score, bbox)
-                        detected_labels.append(label)
-                    
-                    return {
-                        "prediction_uid": uid, 
-                        "detection_count": len(results[0].boxes),
-                        "labels": detected_labels,
-                        "s3_predicted_key": s3_predicted_key,
-                        "source": "s3"
-                    }
-        except (json.JSONDecodeError, KeyError):
-            # If JSON parsing fails or image_name not found, continue to file check
-            pass
+        # Check for image_name in request body first
+        if image_name_request and image_name_request.image_name:
+            image_name = image_name_request.image_name
+            logger.info(f"Processing S3 image: {image_name}")
+            
+            # Download image from S3
+            ext = os.path.splitext(image_name)[1] or '.jpg'
+            original_path = os.path.join(UPLOAD_DIR, uid + ext)
+            download_from_s3(image_name, original_path)
+            s3_original_key = image_name
+            
+            # Process image
+            results, predicted_path = process_image(original_path, uid)
+            
+            # Upload predicted image to S3
+            predicted_s3_key = f"predicted/{uid}{ext}"
+            upload_to_s3(predicted_path, predicted_s3_key)
+            s3_predicted_key = predicted_s3_key
+            
+            # Save to database
+            save_prediction_session(uid, original_path, predicted_path, s3_original_key, s3_predicted_key)
+            
+            # Extract detection results
+            detected_labels = []
+            for box in results[0].boxes:
+                label_idx = int(box.cls[0].item())
+                label = model.names[label_idx]
+                score = float(box.conf[0])
+                bbox = box.xyxy[0].tolist()
+                save_detection_object(uid, label, score, bbox)
+                detected_labels.append(label)
+            
+            return {
+                "prediction_uid": uid, 
+                "detection_count": len(results[0].boxes),
+                "labels": detected_labels,
+                "s3_predicted_key": s3_predicted_key,
+                "source": "s3"
+            }
         
         # If no image_name found, check for attached file
-        if file and file.filename:
+        elif file and file.filename:
             logger.info(f"Processing uploaded file: {file.filename}")
             
             ext = os.path.splitext(file.filename)[1] or '.jpg'
@@ -262,10 +258,11 @@ async def predict(request: Request, file: Optional[UploadFile] = File(None)):
             }
         
         # If neither image_name nor file found, return 400
-        raise HTTPException(
-            status_code=400, 
-            detail="Bad request: Either provide 'image_name' in request body or attach an image file"
-        )
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail="Bad request: Either provide 'image_name' in request body or attach an image file"
+            )
     
     except HTTPException:
         # Re-raise HTTP exceptions
