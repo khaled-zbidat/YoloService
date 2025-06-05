@@ -68,11 +68,17 @@ jobs:
 
     - name: Deploy to Dev EC2
       uses: appleboy/ssh-action@v1.0.3
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
       with:
         host: ${{ secrets.DEV_EC2_HOST }}
         username: ${{ secrets.EC2_USERNAME }}
         key: ${{ secrets.EC2_PRIVATE_KEY }}
         port: 22
+        envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,S3_BUCKET_NAME
         script: |
           # Clone repository if it doesn't exist, otherwise pull latest changes
           if [ ! -d "/home/ubuntu/YoloService" ]; then
@@ -89,6 +95,15 @@ jobs:
           fi
           
           cd /home/ubuntu/YoloService
+          
+          # Create .env file with AWS credentials
+          echo "Creating .env file with AWS credentials..."
+          cat > .env << EOL
+          AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+          AWS_REGION=${AWS_REGION}
+          S3_BUCKET_NAME=${S3_BUCKET_NAME}
+          EOL
           
           # Run deployment script
           chmod +x deploy.sh
