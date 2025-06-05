@@ -16,6 +16,15 @@ from pydantic import BaseModel
 import torch
 torch.cuda.is_available = lambda: False
 
+app = FastAPI()
+
+UPLOAD_DIR = "uploads/original"
+PREDICTED_DIR = "uploads/predicted"
+DB_PATH = "predictions.db"
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(PREDICTED_DIR, exist_ok=True)
+
 # Initialize S3 client
 s3_client = boto3.client(
     's3',
@@ -23,6 +32,10 @@ s3_client = boto3.client(
     aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
     region_name=os.getenv('AWS_REGION', 'eu-central-1')
 )
+
+class PredictRequest(BaseModel):
+    image_name: Optional[str] = None
+    bucket_name: Optional[str] = None
 
 def download_from_s3(bucket_name: str, object_name: str, local_path: str) -> bool:
     """Download a file from S3 bucket"""
@@ -41,19 +54,6 @@ def upload_to_s3(bucket_name: str, file_path: str, object_name: str) -> Optional
     except ClientError as e:
         print(f"Error uploading to S3: {e}")
         return None
-
-class PredictRequest(BaseModel):
-    image_name: Optional[str] = None
-    bucket_name: Optional[str] = None
-
-app = FastAPI()
-
-UPLOAD_DIR = "uploads/original"
-PREDICTED_DIR = "uploads/predicted"
-DB_PATH = "predictions.db"
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(PREDICTED_DIR, exist_ok=True)
 
 # Download the AI model (tiny model ~6MB)
 model = YOLO("yolov8n.pt")  
