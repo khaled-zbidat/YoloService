@@ -6,6 +6,11 @@ import sqlite3
 import os
 import uuid
 import shutil
+import boto3
+from botocore.exceptions import ClientError
+import json
+from typing import Optional
+from pydantic import BaseModel
 #S3
 # Disable GPU usage
 import torch
@@ -19,6 +24,36 @@ DB_PATH = "predictions.db"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PREDICTED_DIR, exist_ok=True)
+
+# Initialize S3 client
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION', 'eu-central-1')
+)
+
+class PredictRequest(BaseModel):
+    image_name: Optional[str] = None
+    bucket_name: Optional[str] = None
+
+def download_from_s3(bucket_name: str, object_name: str, local_path: str) -> bool:
+    """Download a file from S3 bucket"""
+    try:
+        s3_client.download_file(bucket_name, object_name, local_path)
+        return True
+    except ClientError as e:
+        print(f"Error downloading from S3: {e}")
+        return False
+
+def upload_to_s3(bucket_name: str, file_path: str, object_name: str) -> Optional[str]:
+    """Upload a file to S3 bucket"""
+    try:
+        s3_client.upload_file(file_path, bucket_name, object_name)
+        return object_name
+    except ClientError as e:
+        print(f"Error uploading to S3: {e}")
+        return None
 
 # Download the AI model (tiny model ~6MB)
 model = YOLO("yolov8n.pt")  
@@ -76,40 +111,80 @@ def save_detection_object(prediction_uid, label, score, box):
         """, (prediction_uid, label, score, str(box)))
 
 @app.post("/predict")
-def predict(file: UploadFile = File(...)):
+async def predict(request: Request, file: Optional[UploadFile] = File(None)):
     """
-    Predict objects in an image
+    Predict objects in an image. Supports both direct file upload and S3 image reference.
     """
-    ext = os.path.splitext(file.filename)[1]
+    # Try to parse request body for S3 image details
+    try:
+        body = await request.json()
+        predict_request = PredictRequest(**body)
+    except:
+        predict_request = PredictRequest()
+
+    # Generate a unique ID for this prediction
     uid = str(uuid.uuid4())
+    ext = ".jpg"  # Default extension
     original_path = os.path.join(UPLOAD_DIR, uid + ext)
     predicted_path = os.path.join(PREDICTED_DIR, uid + ext)
 
-    with open(original_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # Try to get image from S3 first if image_name is provided
+    if predict_request.image_name and predict_request.bucket_name:
+        if not download_from_s3(predict_request.bucket_name, predict_request.image_name, original_path):
+            raise HTTPException(status_code=404, detail="Failed to download image from S3")
+    # If no S3 image details, try to get uploaded file
+    elif file:
+        ext = os.path.splitext(file.filename)[1]
+        original_path = os.path.join(UPLOAD_DIR, uid + ext)
+        predicted_path = os.path.join(PREDICTED_DIR, uid + ext)
+        
+        with open(original_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    else:
+        raise HTTPException(status_code=400, detail="No image provided - either upload a file or provide S3 image details")
 
+    # Process the image with YOLO
     results = model(original_path, device="cpu")
-
-    annotated_frame = results[0].plot()  # NumPy image with boxes
+    
+    # Generate and save the annotated image
+    annotated_frame = results[0].plot()
     annotated_image = Image.fromarray(annotated_frame)
     annotated_image.save(predicted_path)
 
+    # If we got the image from S3, upload the predicted image back to S3
+    s3_predicted_key = None
+    if predict_request.bucket_name:
+        predicted_s3_key = f"predicted/{os.path.basename(predicted_path)}"
+        s3_predicted_key = upload_to_s3(predict_request.bucket_name, predicted_path, predicted_s3_key)
+
+    # Save prediction session to database
     save_prediction_session(uid, original_path, predicted_path)
     
-    detected_labels = []
+    # Process detection results
+    detected_objects = []
     for box in results[0].boxes:
         label_idx = int(box.cls[0].item())
         label = model.names[label_idx]
         score = float(box.conf[0])
         bbox = box.xyxy[0].tolist()
         save_detection_object(uid, label, score, bbox)
-        detected_labels.append(label)
+        detected_objects.append({
+            "label": label,
+            "confidence": score,
+            "bbox": bbox
+        })
 
-    return {
-        "prediction_uid": uid, 
+    response = {
+        "prediction_uid": uid,
         "detection_count": len(results[0].boxes),
-        "labels": detected_labels
+        "detections": detected_objects,
     }
+
+    # Include S3 key for predicted image if applicable
+    if s3_predicted_key:
+        response["s3_predicted_key"] = s3_predicted_key
+
+    return response
 
 @app.get("/prediction/{uid}")
 def get_prediction_by_uid(uid: str):
