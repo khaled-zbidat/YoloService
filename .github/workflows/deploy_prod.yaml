@@ -1,9 +1,10 @@
-name: Deploy to Production
+name: Deploy to Development
 
 on:
   push:
     branches:
       - main
+
   workflow_dispatch:
 
 jobs:
@@ -62,26 +63,62 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Deploy to EC2
+    - name: Deploy to MAIN EC2
       uses: appleboy/ssh-action@v1.0.3
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
       with:
         host: ${{ secrets.PROD_EC2_HOST }}
         username: ${{ secrets.EC2_USERNAME }}
         key: ${{ secrets.EC2_PRIVATE_KEY }}
         port: 22
+        envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,S3_BUCKET_NAME
         script: |
-          # Clone repository if it doesn't exist, otherwise pull latest changes
+          # Stop any running containers first
+          docker stop yolo-service || true
+          docker rm yolo-service || true
+          
+          echo "📁 Updating repository to MAIN branch..."
+          
           if [ ! -d "/home/ubuntu/YoloService" ]; then
-            echo "📥 Cloning repository..."
+            echo "📥 Cloning repository with main branch..."
             cd /home/ubuntu
-            git clone ${{ github.server_url }}/${{ github.repository }}.git YoloService
+            git clone -b main https://github.com/khaled-zbidat/YoloService.git YoloService
           else
-            echo "📥 Updating repository..."
+            echo "📥 Repository exists, forcing checkout to main branch..."
             cd /home/ubuntu/YoloService
+            
+            # Discard any local changes
+            git reset --hard HEAD
+            git clean -fd
+            
+            # Fetch all branches
+            git fetch --all
+            
+            # Force checkout to main branch
+            git checkout main
+            
+            # Pull latest changes from main
             git pull origin main
           fi
           
           cd /home/ubuntu/YoloService
+          
+          # Verify we're on the right branch and commit
+          echo "✅ Current branch: $(git branch --show-current)"
+          echo "✅ Latest commit: $(git log --oneline -1)"
+          
+          # Create .env file with AWS credentials
+          echo "Creating .env file with AWS credentials..."
+          cat > .env << EOL
+          AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+          AWS_REGION=${AWS_REGION}
+          S3_BUCKET_NAME=${S3_BUCKET_NAME}
+          EOL
           
           # Run deployment script
           chmod +x deploy.sh
@@ -90,4 +127,4 @@ jobs:
           # Verify deployment
           sleep 10
           curl -f http://localhost:8667/health || exit 1
-          echo "🎉 Production deployment successful!"
+          echo "🚀 Production deployment successful!"
