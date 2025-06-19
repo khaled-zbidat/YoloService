@@ -1,5 +1,4 @@
 version: "3.8"
-
 services:
   yolo:
     build: .
@@ -14,7 +13,6 @@ services:
       - AWS_REGION=${AWS_REGION}
       - S3_BUCKET_NAME=${S3_BUCKET_NAME}
     restart: unless-stopped
-
   otelcol:
     image: otel/opentelemetry-collector-contrib:latest
     command: [ "--config=/etc/otelcol/config.yaml" ]
@@ -28,6 +26,6 @@ services:
       - HOST_PROC=/hostfs/proc
       - HOST_SYS=/hostfs/sys
     network_mode: host
-
+    restart: unless-stopped  # Add this line
 volumes:
   yolo-data:
